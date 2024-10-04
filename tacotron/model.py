@@ -5,6 +5,7 @@ from torch.autograd import Variable
 from torch.nn import functional as F
 from dataset import symbols, hps
 import numpy as np
+from gst import GST, hp
 #from utils.util import mode, get_mask_from_lengths
 
 def mode(obj, model = False):
@@ -60,7 +61,7 @@ class ConvNorm(torch.nn.Module):
         conv_signal = self.conv(signal)
         return conv_signal
 
-    
+
 class Tacotron2Loss(nn.Module):
     def __init__(self):
         super(Tacotron2Loss, self).__init__()
@@ -86,7 +87,7 @@ class Tacotron2Loss(nn.Module):
         gate_loss = nn.BCEWithLogitsLoss()(gate_out, gate_target)
         return mel_loss+gate_loss, (mel_loss.item(), gate_loss.item())
 
-    
+
 class Tacotron2Loss_LPC(nn.Module):
     def __init__(self):
         super(Tacotron2Loss_LPC, self).__init__()
@@ -141,7 +142,7 @@ class Tacotron2Loss_LPC(nn.Module):
         pitch_loss_fin = pitch_loss_fin.sum(1).masked_fill_(mel_mask, 0.)/pitch_loss_fin.size(1)
         pitch_loss_fin = pitch_loss_fin.sum()/output_lengths.sum() 
 
-        mel_loss_fin = energy_loss_fin * 1 + cepstral_loss_fin * 0.5 + pitch_loss_fin * 5
+        mel_loss_fin = energy_loss_fin * 2 + cepstral_loss_fin * 1 + pitch_loss_fin * 10
 
         #mel_loss = self.loss(mel_out, mel_target) + \ 
         #    self.loss(mel_out_postnet, mel_target)
@@ -152,7 +153,7 @@ class Tacotron2Loss_LPC(nn.Module):
         
         #return mel_loss+gate_loss, (mel_loss.item(), gate_loss.item())
         
-        return mel_loss_fin+gate_loss*5, (mel_loss_fin.item(), gate_loss.item())
+        return mel_loss_fin+gate_loss*25, (mel_loss_fin.item(), gate_loss.item())
 
 
 class LocationLayer(nn.Module):
@@ -641,6 +642,123 @@ class Tacotron2(nn.Module):
     def inference(self, inputs):
         embedded_inputs = self.embedding(inputs).transpose(1, 2)
         encoder_outputs = self.encoder.inference(embedded_inputs)
+        mel_outputs, gate_outputs, alignments = self.decoder.inference(
+            encoder_outputs)
+
+        mel_outputs_postnet = self.postnet(mel_outputs)
+        mel_outputs_postnet = mel_outputs + mel_outputs_postnet
+
+        outputs = self.parse_output(
+            [mel_outputs, mel_outputs_postnet, gate_outputs, alignments])
+        return outputs
+
+    def teacher_infer(self, inputs, mels):
+        il, _ =  torch.sort(torch.LongTensor([len(x) for x in inputs]),
+                            dim = 0, descending = True)
+        text_lengths = mode(il)
+
+        embedded_inputs = self.embedding(inputs).transpose(1, 2)
+
+        encoder_outputs = self.encoder(embedded_inputs, text_lengths)
+
+        mel_outputs, gate_outputs, alignments = self.decoder(
+            encoder_outputs, mels, memory_lengths=text_lengths)
+        
+        mel_outputs_postnet = self.postnet(mel_outputs)
+        mel_outputs_postnet = mel_outputs + mel_outputs_postnet
+        return self.parse_output(
+            [mel_outputs, mel_outputs_postnet, gate_outputs, alignments])
+
+
+class Tacotron2_with_GST(nn.Module):
+    def __init__(self):
+        super(Tacotron2_with_GST, self).__init__()
+        self.embedding = nn.Embedding(
+            hps.n_symbols, hps.symbols_embedding_dim)
+        std = sqrt(2.0/(hps.n_symbols+hps.symbols_embedding_dim))
+        val = sqrt(3.0)*std
+        self.embedding.weight.data.uniform_(-val, val)
+        self.encoder = Encoder()
+        self.decoder = Decoder()
+        self.postnet = Postnet()
+        # Инициализируем GST
+        self.gst = GST()
+
+    def parse_batch(self, batch):
+        text_padded, input_lengths, mel_padded, gate_padded, output_lengths = batch
+        text_padded = mode(text_padded).long()
+        input_lengths = mode(input_lengths).long()
+        max_len = torch.max(input_lengths.data).item()
+        mel_padded = mode(mel_padded).float()
+        gate_padded = mode(gate_padded).float()
+        output_lengths = mode(output_lengths).long()
+        # Используем mel_padded в качестве ref_mels
+        ref_mels = mel_padded
+        
+        return (
+            (text_padded, input_lengths, mel_padded, max_len, output_lengths),
+            (mel_padded, gate_padded, output_lengths))
+
+    def parse_output(self, outputs, output_lengths=None):
+        if output_lengths is not None:
+            mask = ~get_mask_from_lengths(output_lengths, True) # (B, T)
+            mask = mask.expand(hps.num_mels, mask.size(0), mask.size(1)) # (80, B, T)
+            mask = mask.permute(1, 0, 2) # (B, 80, T)
+            
+            outputs[0].data.masked_fill_(mask, 0.0) # (B, 80, T)
+            outputs[1].data.masked_fill_(mask, 0.0) # (B, 80, T)
+            slice = torch.arange(0, mask.size(2), hps.n_frames_per_step)
+            outputs[2].data.masked_fill_(mask[:, 0, slice], 1e3)  # gate energies (B, T//n_frames_per_step)
+        return outputs
+
+    def forward(self, inputs):
+        text_inputs, text_lengths, mels, max_len, output_lengths = inputs
+        text_lengths, output_lengths = text_lengths.data, output_lengths.data
+        ref_mels = mels
+        
+        # Эмбеддинг текста
+        embedded_inputs = self.embedding(text_inputs).transpose(1, 2)
+        
+        # Получаем эмбеддинг стиля из GST
+        style_embed = self.gst(ref_mels)  # [B, gst_embedding_dim = encoder_embedding_dim = symbols_embedding_dim]
+        
+        # Расширяем размерности style_embed для объединения с embedded_inputs
+        #style_embed = style_embed.unsqueeze(-1).expand(-1, -1, embedded_inputs.size(2))
+        # Объединяем текстовый эмбеддинг и эмбеддинг стиля
+        #encoder_inputs = torch.cat((embedded_inputs, style_embed), dim=1)
+
+        # Расширяем размерности style_embed для суммирования с embedded_inputs
+        style_embed = style_embed.unsqueeze(2)  # [B, 512, 1]
+        style_embed = style_embed.expand(-1, -1, embedded_inputs.size(2))  # [B, 512, T]
+        
+        # Суммируем эмбеддинги
+        encoder_inputs = embedded_inputs + style_embed  # [B, 512, T]
+        
+        # Передаем объединенный эмбеддинг в энкодер
+        encoder_outputs = self.encoder(encoder_inputs, text_lengths)
+
+        mel_outputs, gate_outputs, alignments = self.decoder(
+            encoder_outputs, mels, memory_lengths=text_lengths)
+
+        mel_outputs_postnet = self.postnet(mel_outputs)
+        mel_outputs_postnet = mel_outputs + mel_outputs_postnet
+        return self.parse_output(
+            [mel_outputs, mel_outputs_postnet, gate_outputs, alignments],
+            output_lengths)
+
+    def inference(self, inputs, ref_mels):
+        embedded_inputs = self.embedding(inputs).transpose(1, 2)
+        style_embed = self.gst(ref_mels)
+        #style_embed = style_embed.unsqueeze(-1).expand(-1, -1, embedded_inputs.size(2))
+        #encoder_inputs = torch.cat((embedded_inputs, style_embed), dim=1)
+        
+        # Расширяем размерности style_embed для суммирования с embedded_inputs
+        style_embed = style_embed.unsqueeze(2)  # [B, 512, 1]
+        style_embed = style_embed.expand(-1, -1, embedded_inputs.size(2))  # [B, 512, T]
+        # Суммируем эмбеддинги
+        encoder_inputs = embedded_inputs + style_embed  # [B, 512, T]
+        
+        encoder_outputs = self.encoder.inference(encoder_inputs)
         mel_outputs, gate_outputs, alignments = self.decoder.inference(
             encoder_outputs)
 

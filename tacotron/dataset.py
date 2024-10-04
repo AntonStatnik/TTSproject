@@ -230,6 +230,7 @@ def _get_pronunciation(s):
             return None
     return ' '.join(parts)
 
+
 _pad        = '_'
 _punctuation = '!\'(),.:;? '
 _special = '-'
@@ -297,8 +298,9 @@ def get_unique_symbols_from_metadata(file_path, predefined_order):
     return sorted_symbols + extra_symbols
 
 # Пример использования:
-file_path = '/app/TTSproject/tacotron/datasets/metadata.csv'
-unique_symbols = get_unique_symbols_from_metadata(file_path, predefined_order)
+file_path = '/app/TTSproject/GST-Tacotron/datasets/metadata.csv'
+file_path_for_symbols = '/app/TTSproject/GST-Tacotron/datasets/metadata.csv'
+unique_symbols = get_unique_symbols_from_metadata(file_path_for_symbols, predefined_order)
 symbols = unique_symbols
 
 # Создание словарей
@@ -334,21 +336,21 @@ class hparams:
     ################################
     # Train                        #
     ################################
-    batch_size = 16
+    batch_size = 32
     is_cuda = True
     pin_mem = True
     n_workers = 1
     prep = False    #False #True
-    pth = 'ruslan_lpc.pkl'
+    pth = 'ruRU_ruLS_lpc.pkl'      #'ruRU_ruLS_lpc.pkl'    'ruslan_lpc.pkl'
     lr = 2e-3       #2e-3
     betas = (0.9, 0.999)
     eps = 1e-6
-    sch = False #True 
-    sch_step = 4000
-    max_iter = 387500  #200e3
-    iters_per_log = 10
+    sch = True #True 
+    sch_step = 4000 #4000
+    max_iter = 400000  #200e3
+    iters_per_log = 1000
     iters_per_sample = 500000
-    iters_per_ckpt = 1250
+    iters_per_ckpt = 4000
     weight_decay = 1e-6
     grad_clip_thresh = 1.0
     eg_text = 'Такотрон на элписи коэффициентах на русском.'
@@ -799,7 +801,7 @@ def prepare_dataloaders(fdir, n_gpu):
     return train_loader
 
 
-# ## usage
+# ## usage and batch tests
 # data_dir = '/app/TTSproject/tacotron/datasets/'
 
 # train_loader = prepare_dataloaders(data_dir, 1)

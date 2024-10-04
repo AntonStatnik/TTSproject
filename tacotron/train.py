@@ -6,7 +6,7 @@ import numpy as np
 import torch.optim as optim
 from inference import infer
 from dataset import hparams as hps, ljdataset, ljcollate
-from model import Tacotron2, Tacotron2Loss   #, Tacotron2Loss_LPC
+from model import Tacotron2, Tacotron2Loss, Tacotron2_with_GST
 from utils import mode, Tacotron2Logger, start_timer, end_timer_and_print
 from torch.utils.data import DistributedSampler, DataLoader
 import torch.distributed as dist
@@ -26,18 +26,29 @@ def prepare_dataloaders(fdir, n_gpu):
     return train_loader
 
 
-def load_checkpoint(ckpt_pth, model, optimizer, device, n_gpu):
+def load_checkpoint_prev(ckpt_pth, model, optimizer, device, n_gpu):
     ckpt_dict = torch.load(ckpt_pth, map_location = device)
     (model.module if n_gpu > 1 else model).load_state_dict(ckpt_dict['model'])
     optimizer.load_state_dict(ckpt_dict['optimizer'])
     iteration = ckpt_dict['iteration'] 
     return model, optimizer, iteration
 
+def load_checkpoint(ckpt_pth, model, optimizer, scaler, device, n_gpu):
+    ckpt_dict = torch.load(ckpt_pth, map_location=device)
+    (model.module if n_gpu > 1 else model).load_state_dict(ckpt_dict['model'])
+    optimizer.load_state_dict(ckpt_dict['optimizer'])
+    scaler.load_state_dict(ckpt_dict['scaler'])
+    iteration = ckpt_dict['iteration']
+    return model, optimizer, scaler, iteration
 
-def save_checkpoint(model, optimizer, iteration, ckpt_pth, n_gpu):
-    torch.save({'model': (model.module if n_gpu > 1 else model).state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'iteration': iteration}, ckpt_pth)
+
+def save_checkpoint(model, optimizer, scaler, iteration, ckpt_pth, n_gpu):
+    torch.save({
+        'model': (model.module if n_gpu > 1 else model).state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'scaler': scaler.state_dict(),
+        'iteration': iteration
+    }, ckpt_pth)
 
 
 def train(args):
@@ -55,7 +66,8 @@ def train(args):
     device = torch.device('cuda:{:d}'.format(local_rank))
 
     # build model
-    model = Tacotron2()
+    #model = Tacotron2()
+    model = Tacotron2_with_GST()
     mode(model, True)
     if n_gpu > 1:
         model = torch.nn.parallel.DistributedDataParallel(
@@ -63,15 +75,18 @@ def train(args):
     optimizer = torch.optim.Adam(model.parameters(), lr = hps.lr,
                                 betas = hps.betas, eps = hps.eps,
                                 weight_decay = hps.weight_decay)
-    
     criterion = Tacotron2Loss()
-    #criterion = Tacotron2Loss_LPC()
+    
+    # Initialize GradScaler for AMP
+    scaler = GradScaler()
     
     # load checkpoint
     iteration = 1
     if args.ckpt_pth != '':
-        model, optimizer, iteration = load_checkpoint(args.ckpt_pth, model, optimizer, device, n_gpu)
+        #model, optimizer, iteration = load_checkpoint_prev(args.ckpt_pth, model, optimizer, device, n_gpu)
+        model, optimizer, scaler, iteration = load_checkpoint(args.ckpt_pth, model, optimizer, scaler, device, n_gpu)
         iteration += 1
+        
     
     # get scheduler
     if hps.sch:
@@ -108,18 +123,27 @@ def train(args):
                 break
             start = time.perf_counter()
             x, y = (model.module if n_gpu > 1 else model).parse_batch(batch)
-            y_pred = model(x)
+            
+            # Forward pass with AMP
+            with autocast():
+                y_pred = model(x)
+                loss, items = criterion(y_pred, y)
 
-            # loss
-            loss, items = criterion(y_pred, y)
+            # Zero gradients
+            optimizer.zero_grad()
 
-            # zero grad
-            model.zero_grad()
+            # Backward pass with AMP
+            scaler.scale(loss).backward()
 
-            # backward, grad_norm, and update
-            loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), hps.grad_clip_thresh)
-            optimizer.step()
+            # Unscaling gradients and clipping
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), hps.grad_clip_thresh)
+
+            # Optimizer step
+            scaler.step(optimizer)
+            scaler.update()
+            
             if hps.sch:
                 scheduler.step()
 
@@ -134,29 +158,25 @@ def train(args):
                     learning_rate = optimizer.param_groups[0]['lr']
                     logger.log_training(items, grad_norm, learning_rate, iteration)
 
-                # sample - убрал ннннахуй потому-что как будто влияло на качество обучения, не знаю почему
-                #if args.log_dir != '' and (iteration % hps.iters_per_sample == 0):
-                #    model.eval()
-                #    output = infer(hps.eg_text, model.module if n_gpu > 1 else model)
-                #    model.train()
-                #    logger.sample_train(y_pred, iteration)
-                #    logger.sample_infer(output, iteration)
+                # sample
+                if args.log_dir != '' and (iteration % hps.iters_per_sample == 0):
+                    model.eval()
+                    output = infer(hps.eg_text, model.module if n_gpu > 1 else model)
+                    model.train()
+                    logger.sample_train(y_pred, iteration)
+                    logger.sample_infer(output, iteration)
 
                 # save ckpt
                 if args.ckpt_dir != '' and (iteration % hps.iters_per_ckpt == 0):
                     ckpt_pth = os.path.join(args.ckpt_dir, 'ckpt_{}'.format(iteration))
-                    save_checkpoint(model, optimizer, iteration, ckpt_pth, n_gpu)
-                    
-                    #model, optimizer, iteration = load_checkpoint(ckpt_pth, model, optimizer, device, n_gpu)
+                    save_checkpoint(model, optimizer, scaler, iteration, ckpt_pth, n_gpu)
 
             iteration += 1
         epoch += 1
         
     #save final result 
     ckpt_pth_saved = 'ckpt/ckpt_ru2_' + str(iteration)
-    torch.save({'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'iteration': iteration}, ckpt_pth_saved)
+    save_checkpoint(model, optimizer, scaler, iteration, ckpt_pth_saved, n_gpu)
     
     if rank == 0 and args.log_dir != '':
         logger.close()
